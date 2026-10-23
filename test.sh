@@ -4,6 +4,21 @@ set -u
 cd "$(dirname "$0")"
 fail=0
 
+# Static libc probe for the translator. Build it here so the check cannot
+# silently disappear when /tmp is cleared (it used to be skipped entirely).
+HELLO=/tmp/hello-static
+if [[ ! -x $HELLO ]]; then
+	cat > /tmp/hello.c <<'EOF'
+#include <stdio.h>
+int main(void) { puts("hello from libc"); return 0; }
+EOF
+	if ! gcc -O2 -static -o "$HELLO" /tmp/hello.c 2>/dev/null; then
+		rm -f "$HELLO"
+		HELLO=""
+		echo "skip hello tests (no static libc toolchain)"
+	fi
+fi
+
 expect() {
 	local name="$1" bin="$2" want_out="$3" want_rc="$4"
 	shift 4
@@ -54,7 +69,7 @@ run_pair mem     ./benches/mem     "1115683709"       0
 
 # System-mode (no --direct): bare metal via COM1.
 if [[ -f benches/syshello.bin ]]; then
-	out=$(./fast86 --system --mem 128 benches/syshello.bin 2>/tmp/f86-sys.err) || true
+	out=$(./fast86 --system --mem 128 benches/syshello.bin 2>/tmp/f86-sys.err)
 	rc=$?
 	if ! grep -q 'fast86-system-ok' /tmp/f86-sys.err || [[ "$rc" -ne 0 ]]; then
 		echo "FAIL syshello --system rc=$rc"
@@ -67,7 +82,7 @@ fi
 
 # Kernel-half stack ops (push/pop/ret emulated via SIGSEGV): see benches/syspop.S.
 if [[ -f benches/syspop.bin ]]; then
-	out=$(./fast86 --system --mem 128 benches/syspop.bin 2>/tmp/f86-syspop.err) || true
+	out=$(./fast86 --system --mem 128 benches/syspop.bin 2>/tmp/f86-syspop.err)
 	rc=$?
 	if ! grep -q 'fast86-syspop-ok' /tmp/f86-syspop.err || [[ "$rc" -ne 0 ]]; then
 		echo "FAIL syspop --system rc=$rc"
@@ -79,8 +94,8 @@ if [[ -f benches/syspop.bin ]]; then
 	fi
 fi
 
-if [[ -x /tmp/hello-static ]]; then
-	out=$(./fast86 /tmp/hello-static 2>/tmp/f86-hello.err) || true
+if [[ -n $HELLO && -x $HELLO ]]; then
+	out=$(./fast86 "$HELLO" 2>/tmp/f86-hello.err)
 	rc=$?
 	if [[ "$out" != $'hello from libc' || "$rc" -ne 0 ]]; then
 		echo "FAIL hello translator out=$(printf %q "$out") rc=$rc"
@@ -93,30 +108,35 @@ if [[ -x /tmp/hello-static ]]; then
 	else
 		echo "ok   hello translator"
 	fi
-	expect "hello --direct" /tmp/hello-static $'hello from libc' 0 ./fast86 --direct
+	expect "hello --direct" "$HELLO" $'hello from libc' 0 ./fast86 --direct
 fi
+
+# A zero instruction count means lenchk parsed nothing: that is a failure,
+# not a pass (the check used to go vacuous on a stale empty /tmp/hello.odw).
+lenchk_check() {
+	local name="$1" file="$2" res cnt
+	if ! objdump -dw "$file" > /tmp/f86.od 2>/dev/null; then
+		echo "FAIL lenchk $name (objdump)"
+		fail=1
+		return
+	fi
+	res=$(./lenchk /tmp/f86.od)
+	cnt=$(printf '%s\n' "$res" | sed -n 's/^checked \([0-9][0-9]*\) insns.*/\1/p' | tail -1)
+	if printf '%s\n' "$res" | grep -q ', 0 mismatches' && [[ ${cnt:-0} -gt 0 ]]; then
+		echo "ok   lenchk $name (${cnt:-0} insns)"
+	else
+		echo "FAIL lenchk $name (checked ${cnt:-0})"
+		printf '%s\n' "$res" | grep -E 'MISMATCH|^checked' | head -10
+		fail=1
+	fi
+}
 
 if [[ -x ./lenchk ]]; then
 	for b in benches/int benches/fib benches/regs benches/correct; do
-		objdump -dw "$b" > /tmp/f86.od
-		if ./lenchk /tmp/f86.od | grep -q ', 0 mismatches'; then
-			echo "ok   lenchk $b"
-		else
-			echo "FAIL lenchk $b"
-			./lenchk /tmp/f86.od | tail -5
-			fail=1
-		fi
+		lenchk_check "$b" "$b"
 	done
-	if [[ -f /tmp/hello.odw ]] || objdump -dw /tmp/hello-static > /tmp/hello.odw 2>/dev/null; then
-		res=$(./lenchk /tmp/hello.odw)
-		echo "$res" | tail -1
-		if echo "$res" | grep -q ', 0 mismatches'; then
-			echo "ok   lenchk hello-static"
-		else
-			echo "FAIL lenchk hello-static"
-			echo "$res" | grep MISMATCH | head -10
-			fail=1
-		fi
+	if [[ -n $HELLO && -x $HELLO ]]; then
+		lenchk_check hello-static "$HELLO"
 	fi
 fi
 
@@ -126,7 +146,9 @@ SCRATCH="${SCRATCH:-/tmp/grok-goal-65064a9a1391/implementer}"
 mkdir -p "$SCRATCH"
 BOOTLOG="${BOOT_LOG:-$SCRATCH/boot-1.log}"
 RECV_EFI=""
-for p in /tmp/recvroot/System/Library/CoreServices/boot.efi \
+RECOVERY_ROOT="${RECOVERY_ROOT:-/root/f86-stage/mac-root/macOS Base System}"
+for p in "$RECOVERY_ROOT/System/Library/CoreServices/boot.efi" \
+         /tmp/recvroot/System/Library/CoreServices/boot.efi \
          /tmp/recvol/System/Library/CoreServices/boot.efi; do
 	if [[ -f "$p" ]]; then
 		RECV_EFI="$p"
@@ -165,7 +187,7 @@ elif [[ -z "$RECV_EFI" ]]; then
 	echo "skip recovery boot markers (no assets)"
 else
 	echo "boot log not yet captured" | tee "$SCRATCH/recovery-assets-skip.txt"
-	echo "skip recovery boot markers (no boot-1.log)"
+	echo "skip recovery boot markers (set BOOT_LOG=/root/f86-logs/boot-NN.log to check the goal)"
 fi
 
 if [[ "$fail" -ne 0 ]]; then

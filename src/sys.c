@@ -1341,6 +1341,16 @@ static uint8_t checksum8(const uint8_t *p, size_t n)
 	return (uint8_t)(0u - s);
 }
 
+/* One SMBIOS string: bytes plus its own NUL. The set is closed by an extra
+   NUL, so callers must write one after the last string. */
+static uint8_t *smb_str(uint8_t *p, const char *s)
+{
+	while (*s)
+		*p++ = (uint8_t)*s++;
+	*p++ = 0;
+	return p;
+}
+
 /* Identity-mapped firmware tables so OC's SMBIOS/ACPI probes do not NULL-deref. */
 void f86_sys_plant_fw(void)
 {
@@ -1369,12 +1379,11 @@ void f86_sys_plant_fw(void)
 	p[22] = 1;
 	p[23] = 1;
 	{
-		char *s = (char *)(p + 24);
-		size_t n = 0;
-		memcpy(s + n, "Apple Inc.", 11); n += 11;
-		memcpy(s + n, "IMPRO191.0000.0.0.0", 20); n += 20;
-		memcpy(s + n, "10/12/2024", 11); n += 11;
-		p += 24 + n;
+		uint8_t *t = p;
+		p = t + 24;
+		p = smb_str(p, "Apple Inc.");
+		p = smb_str(p, "IMPRO191.0000.0.0.0");
+		p = smb_str(p, "10/12/2024");
 		*p++ = 0;
 	}
 	/* Type 1 */
@@ -1396,15 +1405,14 @@ void f86_sys_plant_fw(void)
 	p[25] = 5; /* sku */
 	p[26] = 6; /* family */
 	{
-		char *s = (char *)(p + 27);
-		size_t n = 0;
-		memcpy(s + n, "Apple Inc.", 11); n += 11;
-		memcpy(s + n, "iMacPro1,1", 11); n += 11;
-		memcpy(s + n, "1.0", 4); n += 4;
-		memcpy(s + n, "C02F86FAST86", 13); n += 13;
-		memcpy(s + n, "Default", 8); n += 8;
-		memcpy(s + n, "iMac Pro", 9); n += 9;
-		p += 27 + n;
+		uint8_t *t = p;
+		p = t + 27;
+		p = smb_str(p, "Apple Inc.");
+		p = smb_str(p, "iMacPro1,1");
+		p = smb_str(p, "1.0");
+		p = smb_str(p, "C02F86FAST86");
+		p = smb_str(p, "Default");
+		p = smb_str(p, "iMac Pro");
 		*p++ = 0;
 	}
 	/* Type 127 */
@@ -2080,9 +2088,19 @@ static int emulate_sysop(F86CPU *c, const uint8_t *ip, const F86Insn *d)
 				c->cr8 = c->r[rm] & 0xff;
 				g_lapic[0x80 / 4] = (uint32_t)(c->cr8 << 4);
 			}
-			if (cr != 8 && (cr != 3 || ((old3 ^ c->cr3) & ~0xfffull)))
-				fprintf(stderr, "fast86: mov cr%u = %lx (rip=%lx)\n",
-				        cr, (unsigned long)c->r[rm], (unsigned long)c->rip);
+			/* Only log real transitions: fpu_switch_context rewrites CR0 with
+			   an unchanged value on every context switch and used to flood
+			   the log with tens of thousands of identical lines. */
+			uint64_t prev = (cr == 0) ? old : (cr == 3) ? old3 : (cr == 4) ? old4 : ~0ull;
+			if (cr != 8 && (cr == 2 || prev != c->r[rm]) &&
+			    (cr != 3 || ((old3 ^ c->cr3) & ~0xfffull))) {
+				static int ncr[9];
+				if (cr < 9 && ncr[cr] < 64) {
+					ncr[cr]++;
+					fprintf(stderr, "fast86: mov cr%u = %lx (rip=%lx)\n",
+					        cr, (unsigned long)c->r[rm], (unsigned long)c->rip);
+				}
+			}
 			if (cr == 0 && ((old ^ c->cr0) & CR0_PG)) {
 				f86_cache_flush();
 				walk_cache_inval();

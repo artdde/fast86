@@ -22,6 +22,7 @@
 #define EFI_BAD_BUFFER  0x8000000000000005ull
 #define EFI_NOT_READY   0x8000000000000006ull
 #define EFI_NO_MEDIA    0x800000000000000cull
+#define EFI_OUT_OF_RESOURCES 0x8000000000000009ull
 #define EFI_NOT_FOUND   0x800000000000000eull
 #define EFI_NOT_STARTED 0x8000000000000013ull
 
@@ -887,7 +888,7 @@ int f86_uefi_install(uint64_t *out_st)
 			}
 		}
 		uint8_t *ct = f86_ram() + cfg;
-		memset(ct, 0, 96);
+		memset(ct, 0, 96); /* four entries; InstallConfigurationTable grows elsewhere */
 		uint64_t smbp = 0xF0000, acpip = 0xE0000;
 		memcpy(ct + 0, smbios, 16);
 		memcpy(ct + 16, &smbp, 8);
@@ -1408,6 +1409,62 @@ int f86_uefi_dispatch(F86CPU *c, uint32_t id)
 					install_proto(hi, g2, more[k * 2 + 1]);
 			}
 		}
+		c->r[R_RAX] = EFI_SUCCESS;
+		return 0;
+	}
+	case BS_InstallConfigTable: {
+		/* InstallConfigurationTable(Guid, Table): replace or append an
+		   entry in the EFI system table. OpenCore installs the SMBIOS and
+		   ACPI tables it generates here; returning UNSUPPORTED leaves
+		   macOS with the firmware's table and no platform UUID, and the
+		   kernel then blocks forever in IOBSDGetPlatformUUID. The initial
+		   array at g_stub_base+0x3940 holds four entries and is flanked by
+		   other firmware data, so growth moves it to a fresh page. */
+		static uint64_t cfg_tab, cfg_cap;
+		uint8_t *g = gpa_range(a0, 16);
+		uint64_t n = 0, ct = 0;
+		if (!g) {
+			c->r[R_RAX] = EFI_INVALID_PARAM;
+			return 0;
+		}
+		memcpy(&n, f86_ram() + g_st_table + 104, 8);
+		memcpy(&ct, f86_ram() + g_st_table + 112, 8);
+		if (ct != cfg_tab) {
+			cfg_tab = ct;
+			cfg_cap = 4;
+		}
+		uint8_t *tab = gpa_range(ct, cfg_cap * 24);
+		if (!tab) {
+			c->r[R_RAX] = EFI_INVALID_PARAM;
+			return 0;
+		}
+		for (uint64_t i = 0; i < n; i++) {
+			if (memcmp(tab + i * 24, g, 16) == 0) {
+				memcpy(tab + i * 24 + 16, &a1, 8);
+				c->r[R_RAX] = EFI_SUCCESS;
+				return 0;
+			}
+		}
+		if (n >= cfg_cap) {
+			uint64_t np = n < 4096 / 24 ? f86_uefi_alloc(1) : 0;
+			uint8_t *nt = np ? gpa_range(np, 4096) : NULL;
+			if (!nt) {
+				c->r[R_RAX] = EFI_OUT_OF_RESOURCES;
+				return 0;
+			}
+			memcpy(nt, tab, (size_t)n * 24);
+			ct = np;
+			cfg_tab = np;
+			cfg_cap = 4096 / 24;
+			tab = nt;
+			memcpy(f86_ram() + g_st_table + 112, &ct, 8);
+		}
+		memcpy(tab + n * 24, g, 16);
+		memcpy(tab + n * 24 + 16, &a1, 8);
+		n++;
+		memcpy(f86_ram() + g_st_table + 104, &n, 8);
+		fprintf(stderr, "uefi config table guid@%lx -> %lx (n=%lu)\n",
+		        (unsigned long)a0, (unsigned long)a1, (unsigned long)n);
 		c->r[R_RAX] = EFI_SUCCESS;
 		return 0;
 	}

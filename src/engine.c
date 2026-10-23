@@ -2378,6 +2378,27 @@ static void f86_fast_startup_call(void)
 static uint64_t g_trace_rips[32];
 static int g_ntrace = -1;
 
+/* F86_DUMP_OSDICT=unslid[:rdi|rsi|rdx|rcx]: when a block at that (unslid)
+   address is entered, dump the OSDictionary in that register (default rsi).
+   Offsets are the ones this kernel collection's own accessors use:
+   count at 0x20, entries at 0x18, each entry 16 bytes of {OSSymbol *, value},
+   and an OSSymbol's C string at 0x10. Used to see which service an IOKit
+   wait is blocked on. */
+static void dump_cstr(uint64_t va, char *out, size_t n)
+{
+	char tmp[64];
+	size_t i;
+	out[0] = 0;
+	if (!va || !gva_read(va, tmp, sizeof tmp))
+		return;
+	for (i = 0; i + 1 < n && i < sizeof tmp; i++) {
+		if (tmp[i] < 0x20 || tmp[i] >= 0x7f)
+			break;
+		out[i] = tmp[i];
+	}
+	out[i] = 0;
+}
+
 static void trace_rips_init(void)
 {
 	g_ntrace = 0;
@@ -2512,6 +2533,63 @@ static void *special_hook(uint64_t guest_rip)
 			}
 			fprintf(stderr, "\n");
 			map_evict(guest_rip); /* keep tracing this block */
+		}
+	}
+	{
+		/* F86_DUMP_OSDICT: see the OSDictionary an IOKit wait was given. */
+		static uint64_t dsite;
+		static int dreg = R_RSI, dinit, dleft = 8;
+		if (!dinit) {
+			dinit = 1;
+			const char *e = getenv("F86_DUMP_OSDICT");
+			if (e) {
+				char *end = NULL;
+				dsite = strtoull(e, &end, 0);
+				if (end && *end == ':') {
+					if (!strncmp(end + 1, "rdi", 3)) dreg = R_RDI;
+					else if (!strncmp(end + 1, "rdx", 3)) dreg = R_RDX;
+					else if (!strncmp(end + 1, "rcx", 3)) dreg = R_RCX;
+				}
+			}
+		}
+		if (dsite && g_cpu && dleft > 0 &&
+		    guest_rip == dsite + (g_kaddr - 0x100000ull)) {
+			uint64_t obj = g_cpu->r[dreg], ents = 0, key = 0, val = 0;
+			uint64_t ret = 0;
+			uint32_t cnt = 0, i;
+			dleft--;
+			gva_read(g_cpu->r[R_RSP], &ret, 8);
+			if (obj >= 0xffffff8000000000ull &&
+			    gva_read(obj + 0x18, &ents, 8) &&
+			    gva_read(obj + 0x20, &cnt, 4) && cnt <= 32) {
+				fprintf(stderr, "fast86: OSDICT %lx n=%u ret=%lx:",
+				        (unsigned long)obj, cnt,
+				        (unsigned long)(ret ? ret - (g_kaddr - 0x100000ull) : 0));
+				for (i = 0; i < cnt; i++) {
+					char ks[64], vs[64];
+					uint64_t ksp = 0, vsp = 0;
+					if (!gva_read(ents + (uint64_t)i * 16, &key, 8) ||
+					    !gva_read(ents + (uint64_t)i * 16 + 8, &val, 8))
+						break;
+					dump_cstr(0, ks, sizeof ks);
+					dump_cstr(0, vs, sizeof vs);
+					if (gva_read(key + 0x10, &ksp, 8))
+						dump_cstr(ksp, ks, sizeof ks);
+					/* OSSymbol/OSString values hold their C string at
+					   +0x10 like the keys; other classes fail the read. */
+					if (gva_read(val + 0x10, &vsp, 8))
+						dump_cstr(vsp, vs, sizeof vs);
+					if (vs[0])
+						fprintf(stderr, " %s=%s", ks[0] ? ks : "?", vs);
+					else
+						fprintf(stderr, " %s=%lx", ks[0] ? ks : "?",
+						        (unsigned long)val);
+				}
+				fprintf(stderr, "\n");
+			} else {
+				fprintf(stderr, "fast86: OSDICT? site=%lx reg=%lx not a dict\n",
+				        (unsigned long)dsite, (unsigned long)obj);
+			}
 		}
 	}
 	if (!khooks)
@@ -2903,6 +2981,26 @@ void *f86_translate(F86CPU *cpu, uint64_t guest_rip)
 			        (unsigned long)physsz, (unsigned long)fsb,
 			        *(uint32_t *)(p + 1072), *(uint32_t *)(p + 1076),
 			        *(uint32_t *)(p + 1080));
+			/* F86_DUMP_DT=1 dumps boot.efi's device tree and the boot_args
+			   blob so the guest's /efi/platform node can be inspected. */
+			if (getenv("F86_DUMP_DT")) {
+				uint32_t dtp = 0, dtl = 0;
+				memcpy(&dtp, p + 1072, 4);
+				memcpy(&dtl, p + 1076, 4);
+				FILE *f = fopen("/tmp/f86-dt.bin", "wb");
+				if (f) {
+					if (dtp && dtl && (uint64_t)dtp + dtl <= f86_ram_size())
+						fwrite(f86_ram() + dtp, 1, dtl, f);
+					fclose(f);
+					fprintf(stderr, "fast86: DT dump %u bytes @%x -> /tmp/f86-dt.bin\n",
+					        dtl, dtp);
+				}
+				f = fopen("/tmp/f86-ba.bin", "wb");
+				if (f) {
+					fwrite(p, 1, 0x800, f);
+					fclose(f);
+				}
+			}
 			fprintf(stderr, "fast86: ba+0x460: ");
 			for (int i = 0; i < 80; i++)
 				fprintf(stderr, "%02x", p[0x460 + i]);
